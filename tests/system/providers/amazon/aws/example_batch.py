@@ -30,6 +30,7 @@ from airflow.providers.amazon.aws.sensors.batch import (
     BatchJobQueueSensor,
     BatchSensor,
 )
+from airflow.providers.amazon.aws.operators.ecs import EcsDeregisterTaskDefinitionOperator
 from airflow.utils.trigger_rule import TriggerRule
 from tests.system.providers.amazon.aws.utils import (
     ENV_ID_KEY,
@@ -239,6 +240,13 @@ with DAG(
         treat_non_existing_as_deleted=True,
         poke_interval=10,
     )
+
+        deregister_task_definition = EcsDeregisterTaskDefinitionOperator(
+        task_id="deregister_task",
+        task_definition=f"{batch_job_definition_name}:1",
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
 
     log_cleanup = prune_logs(
         [
