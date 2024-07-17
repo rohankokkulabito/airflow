@@ -37,7 +37,7 @@ from pendulum.tz.timezone import FixedTimezone, Timezone
 
 from airflow.compat.functools import cache
 from airflow.configuration import conf
-from airflow.datasets import BaseDataset, Dataset, DatasetAlias, DatasetAll, DatasetAny
+from airflow.datasets import BaseDataset, Dataset, DatasetAll, DatasetAny
 from airflow.exceptions import AirflowException, RemovedInAirflow3Warning, SerializationError, TaskDeferred
 from airflow.jobs.job import Job
 from airflow.models.baseoperator import BaseOperator
@@ -69,7 +69,6 @@ from airflow.task.priority_strategy import (
 from airflow.triggers.base import BaseTrigger, StartTriggerArgs
 from airflow.utils.code_utils import get_python_source
 from airflow.utils.context import Context, OutletEventAccessor, OutletEventAccessors
-from airflow.utils.db import LazySelectSequence
 from airflow.utils.docs import get_docs_url
 from airflow.utils.module_loading import import_string, qualname
 from airflow.utils.operator_resources import Resources
@@ -237,8 +236,6 @@ def encode_dataset_condition(var: BaseDataset) -> dict[str, Any]:
     """
     if isinstance(var, Dataset):
         return {"__type": DAT.DATASET, "uri": var.uri, "extra": var.extra}
-    if isinstance(var, DatasetAlias):
-        return {"__type": DAT.DATASET_ALIAS, "name": var.name}
     if isinstance(var, DatasetAll):
         return {"__type": DAT.DATASET_ALL, "objects": [encode_dataset_condition(x) for x in var.objects]}
     if isinstance(var, DatasetAny):
@@ -259,25 +256,7 @@ def decode_dataset_condition(var: dict[str, Any]) -> BaseDataset:
         return DatasetAll(*(decode_dataset_condition(x) for x in var["objects"]))
     if dat == DAT.DATASET_ANY:
         return DatasetAny(*(decode_dataset_condition(x) for x in var["objects"]))
-    if dat == DAT.DATASET_ALIAS:
-        return DatasetAlias(name=var["name"])
     raise ValueError(f"deserialization not implemented for DAT {dat!r}")
-
-
-def encode_outlet_event_accessor(var: OutletEventAccessor) -> dict[str, Any]:
-    raw_key = var.raw_key
-    return {
-        "extra": var.extra,
-        "dataset_alias_event": var.dataset_alias_event,
-        "raw_key": BaseSerialization.serialize(raw_key),
-    }
-
-
-def decode_outlet_event_accessor(var: dict[str, Any]) -> OutletEventAccessor:
-    raw_key = BaseSerialization.deserialize(var["raw_key"])
-    outlet_event_accessor = OutletEventAccessor(extra=var["extra"], raw_key=raw_key)
-    outlet_event_accessor.dataset_alias_event = var["dataset_alias_event"]
-    return outlet_event_accessor
 
 
 def encode_timetable(var: Timetable) -> dict[str, Any]:
@@ -594,7 +573,7 @@ class BaseSerialization:
             )
         elif isinstance(var, OutletEventAccessor):
             return cls._encode(
-                encode_outlet_event_accessor(var),
+                cls.serialize(var.extra, strict=strict, use_pydantic_models=use_pydantic_models),
                 type_=DAT.DATASET_EVENT_ACCESSOR,
             )
         elif isinstance(var, DAG):
@@ -657,8 +636,6 @@ class BaseSerialization:
             return cls._encode(cls._serialize_param(var), type_=DAT.PARAM)
         elif isinstance(var, XComArg):
             return cls._encode(serialize_xcom_arg(var), type_=DAT.XCOM_REF)
-        elif isinstance(var, LazySelectSequence):
-            return cls.serialize(list(var))
         elif isinstance(var, BaseDataset):
             serialized_dataset = encode_dataset_condition(var)
             return cls._encode(serialized_dataset, type_=serialized_dataset.pop("__type"))
@@ -736,7 +713,7 @@ class BaseSerialization:
             d._dict = cls.deserialize(var)  # type: ignore[attr-defined]
             return d
         elif type_ == DAT.DATASET_EVENT_ACCESSOR:
-            return decode_outlet_event_accessor(var)
+            return OutletEventAccessor(extra=cls.deserialize(var))
         elif type_ == DAT.DAG:
             return SerializedDAG.deserialize_dag(var)
         elif type_ == DAT.OP:
@@ -776,8 +753,6 @@ class BaseSerialization:
             return _XComRef(var)  # Delay deserializing XComArg objects until we have the entire DAG.
         elif type_ == DAT.DATASET:
             return Dataset(**var)
-        elif type_ == DAT.DATASET_ALIAS:
-            return DatasetAlias(**var)
         elif type_ == DAT.DATASET_ANY:
             return DatasetAny(*(decode_dataset_condition(x) for x in var["objects"]))
         elif type_ == DAT.DATASET_ALL:
@@ -870,7 +845,9 @@ class BaseSerialization:
         """Serialize Params dict for a DAG or task as a list of tuples to ensure ordering."""
         serialized_params = []
         for k, v in params.items():
-            # TODO: As of now, we would allow serialization of params which are of type Param only.
+            if isinstance(params, ParamsDict):
+                # Use native param object, not resolved value if possible
+                v = params.get_param(k)
             try:
                 class_identity = f"{v.__module__}.{v.__class__.__name__}"
             except AttributeError:
@@ -878,10 +855,8 @@ class BaseSerialization:
             if class_identity == "airflow.models.param.Param":
                 serialized_params.append((k, cls._serialize_param(v)))
             else:
-                raise ValueError(
-                    f"Params to a DAG or a Task can be only of type airflow.models.param.Param, "
-                    f"but param {k!r} is {v.__class__}"
-                )
+                # Auto-boy other values into Params object like it is done by DAG parsing as well
+                serialized_params.append((k, cls._serialize_param(Param(v))))
         return serialized_params
 
     @classmethod
